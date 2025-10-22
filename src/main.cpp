@@ -2,36 +2,326 @@
 
 // put function declarations here:
 int myFunction(int, int);
-int stepindex=0;
-bool flagNTC=false;
-bool flagMicro=false;
+int stepindex = 0;
+bool flagNTC = false;
+bool flagMicro = false;
 
-bool cmdRelayON=false;
+bool cmdRelayON = false;
 
-int pinRelay =7;
-int pinNTC=1;
-int pinMicro=0;
+int pinRelay = 7;
+int pinNTC = 1;
+int pinMicro = 0;
 
 // --- Configuration ---
-const int NTC_PIN = A1;      // Pin to read the NTC voltage
-const int RELAY_PIN = 7;     // Pin to activate the relay
-const int RESET_PIN = A0;    // NEW: Analog pin for the reset sensor
+const int NTC_PIN = A1;   // Pin to read the NTC voltage
+const int RELAY_PIN = 7;  // Pin to activate the relay
+const int RESET_PIN = A0; // NEW: Analog pin for the reset sensor
 
 // --- Tuning Parameters ---
-const float ALPHA = 0.05;    // Controls the NTC filter's "memory"
-const int TRIGGER_THRESHOLD = 30; // NTC delta to trigger the relay ON
+const float ALPHA = 0.05;         // Controls the NTC filter's "memory"
+const int TRIGGER_THRESHOLD = 5; // NTC delta to trigger the relay ON
 const int RESET_THRESHOLD = 512;  // Value (0-1023) for RESET_PIN to
                                   // trigger the relay OFF. 512 is the
                                   // midpoint (2.5V).
 
 // --- Global Variables ---
-float filteredValue = 0.0;   // Holds the "normal" NTC average
+float filteredValue = 0.0;  // Holds the "normal" NTC average
 bool isRelayActive = false; // This is our main state flag (latch)
 
 bool checkSuddenChange();
 void printDebug(int current, float filtered, int delta);
 void controlMethodSimple(bool &relay);
 void controlMethodSimple2(bool &relay);
+
+// --- Configuration ---
+const int N_SAMPLES = 64;             // FFT sample size (must be power of 2)
+const float SAMPLING_FREQUENCY = 5000; // 1000 Hz (1 kHz)
+const int ANALOG_PIN = A0;             // Pin to read from
+
+// --- Global Buffer ---
+int sampleData[N_SAMPLES]; // An array to store our analog data
+
+float f_peaks[5];     // top 5 frequencies peaks in descending order
+float f_peak_mags[5]; // <--- ADD THIS to store the magnitude of the top 5 peaks
+
+// --- Define your fingerprint ---
+const float TARGET_FREQ_1 = 1400.0;
+const float TARGET_MAG_1 = 20.0;  // Your "loudness" threshold
+const float FREQ_TOLERANCE = 200.0; // Allow 1000 +/- 50 Hz
+
+//---------------------------------------------------------------------------//
+byte sine_data[91] =
+    {
+        0,
+        4, 9, 13, 18, 22, 27, 31, 35, 40, 44,
+        49, 53, 57, 62, 66, 70, 75, 79, 83, 87,
+        91, 96, 100, 104, 108, 112, 116, 120, 124, 127,
+        131, 135, 139, 143, 146, 150, 153, 157, 160, 164,
+        167, 171, 174, 177, 180, 183, 186, 189, 192, 195, // Paste this at top of program
+        198, 201, 204, 206, 209, 211, 214, 216, 219, 221,
+        223, 225, 227, 229, 231, 233, 235, 236, 238, 240,
+        241, 243, 244, 245, 246, 247, 248, 249, 250, 251,
+        252, 253, 253, 254, 254, 254, 255, 255, 255, 255};
+//---------------------------------------------------------------------------//
+
+//-----------------------------FFT Function----------------------------------------------//
+
+float sine(int i)
+{
+  int j = i;
+  float out;
+  while (j < 0)
+  {
+    j = j + 360;
+  }
+  while (j > 360)
+  {
+    j = j - 360;
+  }
+  if (j > -1 && j < 91)
+  {
+    out = sine_data[j];
+  }
+  else if (j > 90 && j < 181)
+  {
+    out = sine_data[180 - j];
+  }
+  else if (j > 180 && j < 271)
+  {
+    out = -sine_data[j - 180];
+  }
+  else if (j > 270 && j < 361)
+  {
+    out = -sine_data[360 - j];
+  }
+  return (out / 255);
+}
+
+float cosine(int i)
+{
+  int j = i;
+  float out;
+  while (j < 0)
+  {
+    j = j + 360;
+  }
+  while (j > 360)
+  {
+    j = j - 360;
+  }
+  if (j > -1 && j < 91)
+  {
+    out = sine_data[90 - j];
+  }
+  else if (j > 90 && j < 181)
+  {
+    out = -sine_data[j - 90];
+  }
+  else if (j > 180 && j < 271)
+  {
+    out = -sine_data[270 - j];
+  }
+  else if (j > 270 && j < 361)
+  {
+    out = sine_data[j - 270];
+  }
+  return (out / 255);
+}
+
+float FFT(int in[], int N, float Frequency)
+{
+  /*
+  Code to perform FFT on arduino,
+  setup:
+  paste sine_data [91] at top of program [global variable], paste FFT function at end of program
+  Term:
+  1. in[]     : Data array,
+  2. N        : Number of sample (recommended sample size 2,4,8,16,32,64,128...)
+  3. Frequency: sampling frequency required as input (Hz)
+
+  If sample size is not in power of 2 it will be clipped to lower side of number.
+  i.e, for 150 number of samples, code will consider first 128 sample, remaining sample  will be omitted.
+  For Arduino nano, FFT of more than 128 sample not possible due to mamory limitation (64 recomended)
+  For higher Number of sample may arise Mamory related issue,
+  Code by ABHILASH
+  Contact: abhilashpatel121@gmail.com
+  Documentation:https://www.instructables.com/member/abhilash_patel/instructables/
+  */
+
+  unsigned int data[13] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+  int a, c1, f, o, x;
+  a = N;
+
+  for (int i = 0; i < 12; i++) // calculating the levels
+  {
+    if (data[i] <= a)
+    {
+      o = i;
+    }
+  }
+
+  int in_ps[data[o]] = {};    // input for sequencing
+  float out_r[data[o]] = {};  // real part of transform
+  float out_im[data[o]] = {}; // imaginory part of transform
+
+  x = 0;
+  for (int b = 0; b < o; b++) // bit reversal
+  {
+    c1 = data[b];
+    f = data[o] / (c1 + c1);
+    for (int j = 0; j < c1; j++)
+    {
+      x = x + 1;
+      in_ps[x] = in_ps[j] + f;
+    }
+  }
+
+  for (int i = 0; i < data[o]; i++) // update input array as per bit reverse order
+  {
+    if (in_ps[i] < a)
+    {
+      out_r[i] = in[in_ps[i]];
+    }
+    if (in_ps[i] > a)
+    {
+      out_r[i] = in[in_ps[i] - a];
+    }
+  }
+
+  int i10, i11, n1;
+  float e, c, s, tr, ti;
+
+  for (int i = 0; i < o; i++) // fft
+  {
+    i10 = data[i];               // overall values of sine/cosine  :
+    i11 = data[o] / data[i + 1]; // loop with similar sine cosine:
+    e = 360 / data[i + 1];
+    e = 0 - e;
+    n1 = 0;
+
+    for (int j = 0; j < i10; j++)
+    {
+      c = cosine(e * j);
+      s = sine(e * j);
+      n1 = j;
+
+      for (int k = 0; k < i11; k++)
+      {
+        tr = c * out_r[i10 + n1] - s * out_im[i10 + n1];
+        ti = s * out_r[i10 + n1] + c * out_im[i10 + n1];
+
+        out_r[n1 + i10] = out_r[n1] - tr;
+        out_r[n1] = out_r[n1] + tr;
+
+        out_im[n1 + i10] = out_im[n1] - ti;
+        out_im[n1] = out_im[n1] + ti;
+
+        n1 = n1 + i10 + i10;
+      }
+    }
+  }
+
+  /*
+  for(int i=0;i<data[o];i++)
+  {
+  Serial.print(out_r[i]);
+  Serial.print("\t");                                     // un comment to print RAW o/p
+  Serial.print(out_im[i]); Serial.println("i");
+  }
+  */
+
+  //---> here onward out_r contains amplitude and our_in conntains frequency (Hz)
+  for (int i = 0; i < data[o - 1]; i++) // getting amplitude from compex number
+  {
+    out_r[i] = sqrt(out_r[i] * out_r[i] + out_im[i] * out_im[i]); // to  increase the speed delete sqrt
+    out_im[i] = i * Frequency / N;
+    /*
+    Serial.print(out_im[i]); Serial.print("Hz");
+    Serial.print("\t");                            // un comment to print freuency bin
+    Serial.println(out_r[i]);
+    */
+  }
+
+  x = 0; // peak detection
+  for (int i = 1; i < data[o - 1] - 1; i++)
+  {
+    if (out_r[i] > out_r[i - 1] && out_r[i] > out_r[i + 1])
+    {
+      in_ps[x] = i; // in_ps array used for storage of peak number
+      x = x + 1;
+    }
+  }
+
+  s = 0;
+  c = 0;
+  for (int i = 0; i < x; i++) // re arraange as per magnitude
+  {
+    for (int j = c; j < x; j++)
+    {
+      if (out_r[in_ps[i]] < out_r[in_ps[j]])
+      {
+        s = in_ps[i];
+        in_ps[i] = in_ps[j];
+        in_ps[j] = s;
+      }
+    }
+    c = c + 1;
+  }
+
+  for (int i = 0; i < 5; i++) // updating f_peak array (global variable)with descending order
+  {
+    f_peaks[i] = out_im[in_ps[i]];
+    f_peak_mags[i] = out_r[in_ps[i]]; // <--- ADD THIS LINE
+  }
+}
+
+/**
+ * @brief Collects a set number of samples from an analog pin at a fixed frequency.
+ * * This is a "blocking" function. It will pause execution until all
+ * samples are collected.
+ * * @param dataBuffer An integer array to store the collected samples.
+ * @param numSamples The number of samples to collect (e.g., 64, 128).
+ * @param samplingFrequencyHz The desired sampling frequency in Hz (e.g., 1000.0).
+ * @param analogPin The analog pin to read from (e.g., A0, A1, etc.).
+ * @return true if sampling was successful.
+ * @return false if the samplingFrequencyHz is too high for the Arduino's ADC.
+ */
+bool collectSamples(int dataBuffer[], int numSamples, float samplingFrequencyHz, int analogPin)
+{
+  // Calculate the required sampling period in microseconds
+  float samplingPeriodUs = 1000000.0 / samplingFrequencyHz;
+
+  // Check if the sampling frequency is too fast for the Arduino's analogRead()
+  // On an Arduino Uno, analogRead() takes about 104 microseconds.
+  // We add a small buffer for safety.
+  if (samplingPeriodUs <= 105.0)
+  {
+    // Frequency is too high!
+    return false;
+  }
+
+  unsigned long startTime;
+
+  for (int i = 0; i < numSamples; i++)
+  {
+    // Record the start time for this sample
+    startTime = micros();
+
+    // Read the analog pin and center the data around 0
+    dataBuffer[i] = (analogRead(analogPin) - 684) >> 2;
+
+    // Wait until the sampling period has elapsed
+    while (micros() - startTime < samplingPeriodUs)
+    {
+      // This "busy-wait" loop ensures our timing is precise.
+    }
+  }
+
+  // All samples collected successfully
+  return true;
+}
+
+//------------------------------------------------------------------------------------//
 
 void debug()
 {
@@ -40,83 +330,171 @@ void debug()
   Serial.println(analogRead(A1));
 }
 
+void setup()
+{
 
-void setup() {
-
-  Serial.begin(9600);
-  pinMode(pinRelay,OUTPUT);
+  Serial.begin(115200);
+  pinMode(pinRelay, OUTPUT);
 }
 
-void loop() {
- 
-bool a;
- controlMethodSimple2(a);
-  digitalWrite(pinRelay,cmdRelayON);
-  debug();
+void loop()
+{
+
+  bool a;
+    bool stsTriggerMicro=false;
+  //controlMethodSimple2(a);
+  digitalWrite(pinRelay, cmdRelayON);
+
+  // debug();
+
+  // 1. COLLECT SAMPLES
+  // This function will pause and fill the 'sampleData' array
+  // Serial.print("Collecting ");
+  // Serial.print(N_SAMPLES);
+  // Serial.println(" samples...");
+
+  bool samplingSuccess = collectSamples(sampleData, N_SAMPLES, SAMPLING_FREQUENCY, ANALOG_PIN);
+
+  // 2. PROCESS SAMPLES
+  if (samplingSuccess)
+  {
+   // Serial.println("Sampling complete. Running FFT...");
+
+    // Run the FFT on the data we just collected
+    // We pass the SAMPLING_FREQUENCY we used to collect the data
+    FFT(sampleData, N_SAMPLES, SAMPLING_FREQUENCY);
+
+   // Serial.println("--- Sound Profile ---");
+    for (int i = 0; i < 5; i++)
+    {
+      // Serial.print("Peak ");
+      // Serial.print(i);
+      // Serial.print(": Freq=");
+      // Serial.print(f_peaks[i]);
+      // Serial.print(" Hz,  Mag=");
+      // Serial.println(f_peak_mags[i]);
+      
+    }
+// 3. DETECTION LOGIC
+  // Check if the LOUDEST peak (f_peaks[0]) matches our fingerprint
+  bool freqMatch = (f_peaks[0] > (TARGET_FREQ_1 - FREQ_TOLERANCE)) &&
+                   (f_peaks[0] < (TARGET_FREQ_1 + FREQ_TOLERANCE));
+
+  bool magMatch = (f_peak_mags[0] > TARGET_MAG_1);
+
+  // (Optional) Check the 2nd peak
+  // bool freqMatch2 = (f_peaks[1] > (TARGET_FREQ_2 - FREQ_TOLERANCE)) &&
+  //                   (f_peaks[1] < (TARGET_FREQ_2 + FREQ_TOLERANCE));
+
+  // --- TRIGGER ---
+  if (freqMatch && magMatch)
+  {
+    // (Optional: add && freqMatch2 to be even more specific)
+
+   // Serial.println(">>> FINGERPRINT DETECTED! <<<");
+    stsTriggerMicro=true;
+    //
+    // --- YOUR ACTION GOES HERE ---
+    // (e.g., digitalWrite(LED_PIN, HIGH);)
+    //
+  }
+  else
+  {
+    stsTriggerMicro=false;
+  }
+
+
+
+    //Serial.println("---------------------");
+  }
+  else
+  {
+    // This will happen if SAMPLING_FREQUENCY is too high
+    Serial.println("Error: Sampling frequency is too high for this Arduino!");
+    Serial.println("Try a frequency below 9600 Hz.");
+  }
+
   
+
+
+    int valMicroAnalog = analogRead(A0);
+  int valNTCAnalog = analogRead(A1);
+
+  bool stsTriggerNTC = checkSuddenChange();
+
+  if (stsTriggerNTC)
+  {
+    cmdRelayON = true;
+    Serial.println("ONNNN");
+  }
+
+  else if (stsTriggerMicro)
+  {
+    cmdRelayON = false;
+    Serial.println("OFFFFF");
+  }
+
+
+
+
 }
 
 void controlMethodSimple2(bool &relay)
 {
 
-  int valMicroAnalog=analogRead(A0);
-  int valNTCAnalog=analogRead(A1);
+  int valMicroAnalog = analogRead(A0);
+  int valNTCAnalog = analogRead(A1);
 
-  bool stsTriggerMicro=valMicroAnalog>800;
-  bool stsTriggerNTC=checkSuddenChange();
+  bool stsTriggerMicro = valMicroAnalog > 800;
+  bool stsTriggerNTC = checkSuddenChange();
 
-  if(stsTriggerNTC)
+  if (stsTriggerNTC)
   {
-    cmdRelayON=false;
+    cmdRelayON = false;
     Serial.println("ONNNN");
   }
-  
-  else if(stsTriggerMicro)
+
+  else if (stsTriggerMicro)
   {
-      cmdRelayON=true;
-      Serial.println("OFFFFF");
+    cmdRelayON = true;
+    Serial.println("OFFFFF");
   }
-
 }
-
-
 
 void controlMethodSimple(bool &relay)
 {
 
-  int valMicroAnalog=analogRead(A0);
-  int valNTCAnalog=analogRead(A1);
+  int valMicroAnalog = analogRead(A0);
+  int valNTCAnalog = analogRead(A1);
 
-  bool stsTriggerMicro=valMicroAnalog>600;
-  bool stsTriggerNTC=checkSuddenChange();
-  if(stsTriggerMicro && !flagMicro)
+  bool stsTriggerMicro = valMicroAnalog > 600;
+  bool stsTriggerNTC = checkSuddenChange();
+  if (stsTriggerMicro && !flagMicro)
   {
-    cmdRelayON=false;
-    flagMicro=true;
+    cmdRelayON = false;
+    flagMicro = true;
   }
-  else if(!stsTriggerMicro && flagMicro)
+  else if (!stsTriggerMicro && flagMicro)
   {
-    flagMicro=false;
-  }
-
-
-  if(stsTriggerNTC && !flagNTC)
-  {
-    cmdRelayON=true;
-    flagNTC=true;
-  }
-  else if(!stsTriggerNTC && flagNTC)
-  {
-    flagNTC=false;
+    flagMicro = false;
   }
 
+  if (stsTriggerNTC && !flagNTC)
+  {
+    cmdRelayON = true;
+    flagNTC = true;
+  }
+  else if (!stsTriggerNTC && flagNTC)
+  {
+    flagNTC = false;
+  }
 }
 
-
-bool checkSuddenChange() {
-  bool returnValue=false;
+bool checkSuddenChange()
+{
+  bool returnValue = false;
   // 1. Get the current raw reading
-  int currentValue = analogRead(0);
+  int currentValue = analogRead(1);
 
   // 2. Update the slow-moving average
   filteredValue = (ALPHA * currentValue) + ((1.0 - ALPHA) * filteredValue);
@@ -126,23 +504,24 @@ bool checkSuddenChange() {
   int delta = filteredValue - currentValue;
 
   // 4. Check for a trigger event
-  if (delta > TRIGGER_THRESHOLD) {
+  if (delta > TRIGGER_THRESHOLD)
+  {
     // --- EVENT DETECTED ---
     isRelayActive = true; // Set the latch!
-    
-    Serial.print("Lighter DETECTED! Delta: ");
-    Serial.println(delta);
-    Serial.println("RELAY LATCHED ON.");
-    returnValue=true;
+
+    // Serial.print("Lighter DETECTED! Delta: ");
+    // Serial.println(delta);
+    // Serial.println("RELAY LATCHED ON.");
+    returnValue = true;
   }
-  
+
   // Optional: Uncomment to see the NTC values for tuning
-   printDebug(currentValue, filteredValue, delta);
-   return returnValue;
+  //printDebug(currentValue, filteredValue, delta);
+  return returnValue;
 }
 
-
-void printDebug(int current, float filtered, int delta) {
+void printDebug(int current, float filtered, int delta)
+{
   Serial.print("Current: ");
   Serial.print(current);
   Serial.print("\t Average: ");
